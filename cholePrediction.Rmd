@@ -1,0 +1,239 @@
+---
+title: "Choledocholithiasis Prediction"
+author: "Bohao Tang"
+date: "November 19, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Cleaning Data and EDA
+
+There're several questions need to be clarified for this data. Maybe we firstly just show a demo for methods we will use.
+
+First question is that what is the outcome "Actual Stone" variable. `MRCP`,`EUS`,`ERCP`,`IOC` seem to be four kind of measurement(and treatment), sometimes their values have confliction. Here in the demo we use (not exactly) the `stone/sludge` value of last measurement to be the truth.
+
+Second question is that should we use some value (not the last measurement) from `MRCP`,`EUS`,`ERCP`,`IOC` as a predictor, since they happen in some order in data, maybe we can use some previous value as a strong predictor. But here in the demo, we don't use them.
+
+Third question may be the most important one. What's the study design? Is there a systematic pattern in the missing data? From the feature `What modality used to evaluate first` it seems the data is collected somehow related to a prediction of some other model. Then we should be careful when we do the analysis. Maybe we can discuss this later and for more details of the design. Here in the demo we do an exploration for the missing pattern and choose a likely version as the base of analysis (which might be terribly wrong in reality).
+
+Fourth question is that there're some not missing 2nd measured value where `2ndset labs drawn prior to first evaluation MRCP/EUS/ERCP/IOC?` is 0, can we use that value? Are them as valid as others where `2ndset labs drawn prior to first evaluation` is 1?
+
+Last question is for the goal. As you said in the study plan, we need a classifier, but for the desicion making, I don't quite have the resonable threshold. I think I need to have a risk for `post-Sphincterotomy bleed` and `post CCY bleed` and something else. Although I can fit them in the data but the existence for previous two is quite rare, there should be a lot of variation in direct analysis. Also I may predict that from `What modality used to evaluate first`, because this seems to be from another model and therefore I can check their threshold probability. But this is kind of weird. Let's discuss this later and if I have the threshold I can do decision to minimize the risk with some other restriction. Also, explainable is another questionable point, is there a limited amount of question or number I can enter in the website? Here in the demo, I only compare the model with ROC curve and discuss some about the explainability.
+
+Now let's do some exploration for the data.
+```{r, message=F}
+library(readxl)
+library(tidyverse)
+library(pROC)
+library(randomForest)
+library(rpart)
+library(xgboost)
+
+choledata <- read_excel("Choledocholithiasis study - Elmunzer.xlsx")
+
+# We don't use `What modality used to evaluate first` as a covariate
+chole.covariate = choledata[,c(1:11,13:38)]
+chole.treatment = choledata[,c(12,39:49)]
+# We mainly use the original covariate without further feature like `Drop in AP` in first stage.
+chole.covariate.raw = chole.covariate[,-c(15,17:19,21,23:26,28,30:32,35:37)]
+# Finding the `actual stone` variable  
+treatments = colnames(chole.treatment)[c(1,3,5,7,10)]
+actual_stone = function(treatments){
+    res = treatments[2:5]  
+    flag = rep(1,4); flag[treatments[1]+1] = NA
+    
+    if(sum(!is.na(res)) == 0){
+        return(NA)
+    }
+    else if(sum(!is.na(res)) == 1){
+        return(res[!is.na(res)])
+    }
+    else{
+        res = res * flag
+        res = res[!is.na(res)]
+        return(res[length(res)])
+    }
+}
+stone = c()
+for(i in 1:nrow(chole.treatment[treatments])){
+    tr = as.numeric(chole.treatment[i,treatments])
+    stone = c(stone, actual_stone(tr))
+}
+chole.treatment$`Actual Stone` = factor(stone)
+
+# main data we will study
+chole.raw = cbind(chole.covariate.raw, chole.treatment["Actual Stone"])[!is.na(chole.treatment$`Actual Stone`),] %>% select(-c(Subject,`CCY Date`))
+
+missing = c()
+for(i in 1:nrow(chole.raw)) {
+  if(anyNA(chole.raw[i,]))
+    missing = c(missing, 1)
+  else
+    missing = c(missing, 0)
+}
+
+chole.raw$Missing = as.factor(missing)
+chole.raw$firstModality = as.factor(chole.treatment$`What modality used to evaluate first (MRCP=0/EUS=1/ERCP=2/IOC=3)?`[!is.na(chole.treatment$`Actual Stone`)])
+colnames(chole.raw)[2] = "Sex"
+chole.raw$Sex = as.factor(chole.raw$Sex)
+
+
+# Let's do a lot of exploration for the missing pattern
+
+### Missing Rate
+###### Not quite big, we may drop them and get a reasonable model if the missing is at random. 
+mean(as.numeric(chole.raw$Missing)-1)
+
+### Do some continuing variables have significant different distribution between missing and not missing?
+###### Seems not quite different
+chole.raw %>% ggplot(aes(x=Age, col=Missing, fill=Missing)) + geom_density(alpha=0.7)
+chole.raw %>% ggplot(aes(x=`Presenting AST`, col=Missing, fill=Missing)) + geom_density(alpha=0.7)
+chole.raw %>% ggplot(aes(x=`Presenting AP`, col=Missing, fill=Missing)) + geom_density(alpha=0.7)
+
+### Do some categorical variables have significant different distribution between missing and not missing?
+###### Seems not quite different
+chisq.test(table(chole.raw$Missing,chole.raw$`Sex`))
+chisq.test(table(chole.raw$Missing,chole.raw$`1st T. Bili >4?`))
+chisq.test(table(chole.raw$Missing,chole.raw$`Presenting ASGE High Risk probability?`))
+chisq.test(table(chole.raw$Missing,chole.raw$`Actual Stone`))
+
+```
+
+After the exploration, in principle we still don't know the missing pattern because we still don't know the missing value, but from here I just suppose that the data is missing at random. That its missing state is independent of missing value (and outcome) conditional on observed value. In this sense imputing is legal and now let's begin testing several models.
+
+```{r}
+# First let's do a baseline model
+# We evenly split missing and not missing raw into training:testing 7:3
+
+missing.index = (1:nrow(chole.raw))[chole.raw$Missing == 1]
+nonmissing.index = (1:nrow(chole.raw))[chole.raw$Missing == 0]
+
+missing.train = sample(missing.index, floor(0.7*length(missing.index)))
+nonmissing.train = sample(nonmissing.index, floor(0.7*length(nonmissing.index)))
+
+chole.train = chole.raw[c(missing.train, nonmissing.train),]
+chole.test = chole.raw[-c(missing.train, nonmissing.train),]
+
+# If `What modality used to evaluate first (MRCP=0/EUS=1/ERCP=2/IOC=3)?` is truly from prediction of other model
+# then we just use this to build the baseline model build from GLM, randomForest and decision tree. 
+### GLM
+baseline.glm = glm(`Actual Stone` ~ firstModality, data=chole.train, family="binomial")
+prediction = predict(baseline.glm, chole.test, type="response")
+accuracy = mean(as.numeric(prediction > 0.5) == chole.test$`Actual Stone`); accuracy
+roc.base.glm = roc(chole.test$`Actual Stone`,prediction); roc.base.glm
+plot(roc.base.glm)
+```
+
+We treat that model as the baseline. Then we test some other models, we exclude `What modality used to evaluate first` for now.
+
+```{r, message=F, warning=F}
+
+# Let first add drop ratio in the data to assist the algorithm, or it is hard to learn the ratio
+# Also we change colnames to some regular string
+colnames(chole.raw) = c("age","sex","T.Bili_4","USperformed","USVisibleCBD","CBD_6","T.Bili1.8_4","ASGE_highrisk",
+                        "suspected_gallstone","firstLabprior","secondLabprior","AST","AST2","ALT","ALT2","AP","AP2",
+                        "TB","TB2","ActualStone","Missing","firstModality")
+
+chole.raw$USperformed = as.factor(chole.raw$USperformed)
+chole.raw$firstLabprior = as.factor(chole.raw$firstLabprior)
+chole.raw$secondLabprior = as.factor(chole.raw$secondLabprior)
+
+chole.raw$ASTdrop = chole.raw$AST/chole.raw$AST2 - 1
+chole.raw$ALTdrop = chole.raw$ALT/chole.raw$ALT2 - 1
+chole.raw$APdrop = chole.raw$AP/chole.raw$AP2 - 1
+chole.raw$TBdrop = chole.raw$TB/chole.raw$TB2 - 1
+
+chole.train = chole.raw[c(missing.train, nonmissing.train),]
+chole.test = chole.raw[-c(missing.train, nonmissing.train),]
+
+### A decision tree can deal with missing value as another catagory and we use it first
+full.dt = rpart(ActualStone ~ ., chole.train%>%select(-firstModality), method = "class"); full.dt
+prediction =  predict(full.dt, chole.test, type = "prob")[,2]
+accuracy = mean(as.numeric(prediction>0.5) == chole.test$ActualStone); accuracy
+roc.dt = roc(chole.test$ActualStone, prediction); roc.dt
+plot(roc.dt)
+
+### Then do a GLM
+#### Design a reasonable biggest formula for Missing data and then do backward step search
+#### Impute NA number with 1 since we will not use them directly
+
+chole.train.zero = chole.raw[c(missing.train, nonmissing.train),]
+chole.train.zero[is.na(chole.train.zero)] = 1
+chole.test.zero = chole.raw[-c(missing.train, nonmissing.train),]
+chole.test.zero[is.na(chole.test.zero)] = 1
+
+full.formula = as.formula(
+                 "ActualStone ~ 
+                  age + sex + T.Bili_4 + T.Bili1.8_4 +  Missing +
+                  USperformed + USperformed:USVisibleCBD + USperformed:CBD_6 +
+                  ASGE_highrisk + suspected_gallstone + 
+                  log(AST) + log(ALT) + log(AP) + log(TB) +
+                  AST + ALT + AP + TB +
+                  secondLabprior + secondLabprior:log(AST2) + secondLabprior:log(ALT2) + 
+                                   secondLabprior:log(AP2) + secondLabprior:log(TB2) + 
+                                   secondLabprior:AST2 + secondLabprior:ALT2 + 
+                                   secondLabprior:AP2 + secondLabprior:TB2"
+                 )
+          
+sglm = step(glm(full.formula, data=chole.train.zero, family="binomial"), direction = "backward", trace = F)
+summary(sglm)
+prediction = predict(sglm, chole.test.zero, type="response")
+accuracy = mean(as.numeric(prediction>0.5) == chole.test.zero$ActualStone); accuracy
+roc.glm = roc(chole.test.zero$ActualStone, prediction); roc.glm
+plot(roc.glm)
+
+# Then do a random forest, replace NA value to -1
+chole.train.minus = chole.raw[c(missing.train, nonmissing.train),]
+chole.train.minus[is.na(chole.train.minus)] = -1
+chole.test.minus = chole.raw[-c(missing.train, nonmissing.train),]
+chole.test.minus[is.na(chole.test.minus)] = -1
+
+full.rf = randomForest(ActualStone~.-firstModality, chole.train.minus)
+full.rf$importance
+prediction = predict(full.rf, chole.test.minus, type = "prob")[,2]
+accuracy = mean(as.numeric(prediction>0.5) == chole.test.minus$ActualStone); accuracy
+roc.rf = roc(chole.test.minus$ActualStone, prediction); roc.rf
+plot(roc.rf)
+
+# Then we do an xgboost method
+traindata = as.matrix(sapply(chole.train[,c(1:19,21,23:26)], as.numeric))
+trainlabel = as.matrix(chole.train)[,20]
+testdata = as.matrix(sapply(chole.test[,c(1:19,21,23:26)], as.numeric))
+testlabel = as.matrix(chole.test)[,20]
+xgbs = list(); roc.xgb = list()
+accuracy = c()
+alphas = 10^seq(-4,2,length.out=30)
+for(i in 1:30) {
+  xgbs[[i]] = xgboost(traindata, trainlabel, nrounds = 100, max_depth = 10, eta = 1, alpha=alphas[i], verbose = F)
+  prediction = predict(xgbs[[i]], testdata, type = "prob")
+  accuracy = c(accuracy, mean(as.numeric(prediction>0.5) == chole.test$ActualStone))
+  roc.xgb[[i]] = roc(chole.test$ActualStone, prediction)
+}
+accuracy[which.max(sapply(roc.xgb, function(roc){roc$auc}))]
+roc.xgb[[which.max(sapply(roc.xgb, function(roc){roc$auc}))]]$auc
+plot(roc.xgb[[which.max(sapply(roc.xgb, function(roc){roc$auc}))]])
+```
+
+We can also do imputing in the future. But the demo here is to show problems need to be discussed. Bascially you can find that the power of `What modality used to evaluate first` is very powerful and excluding this we get only competitive but not better models in most cases (due to randomness of spliting training data). Let's discuss this later.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
